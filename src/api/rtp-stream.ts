@@ -1,10 +1,11 @@
 import { isRtcp, RtpPacket } from 'werift';
 
-import { AV_HWDEVICE_TYPE_NONE, AV_PICTURE_TYPE_I, AV_PIX_FMT_YUV420P, AV_SAMPLE_FMT_FLTP } from '../constants/constants.js';
+import { AV_CODEC_ID_HEVC, AV_HWDEVICE_TYPE_NONE, AV_PICTURE_TYPE_I, AV_PIX_FMT_YUV420P, AV_SAMPLE_FMT_FLTP } from '../constants/constants.js';
 import { FF_ENCODER_LIBOPUS, FF_ENCODER_LIBX264, FF_ENCODER_LIBX265 } from '../constants/encoders.js';
 import { Codec } from '../lib/codec.js';
 import { Rational } from '../lib/rational.js';
 import { avChannelLayoutDefault, avGetPixFmtName } from '../lib/utilities.js';
+import { BitStreamFilterAPI } from './bitstream-filter.js';
 import { MAX_PACKET_SIZE } from './constants.js';
 import { Decoder } from './decoder.js';
 import { Demuxer } from './demuxer.js';
@@ -91,6 +92,7 @@ export interface RTPStreamOptions {
     width?: number;
     height?: number;
     bitrate?: number;
+    dumpExtra?: boolean;
     encoderOptions?: EncoderOptions['options'];
   };
 
@@ -205,6 +207,7 @@ export class RTPStream {
   private videoDecoder?: Decoder;
   private videoFilter?: FilterAPI;
   private videoEncoder?: Encoder;
+  private videoBitstreamFilter?: BitStreamFilterAPI;
   private audioDecoder?: Decoder;
   private audioFilter?: FilterAPI;
   private audioEncoder?: Encoder;
@@ -507,6 +510,8 @@ export class RTPStream {
     const videoStream = this.input.video();
     const audioStream = this.input.audio();
 
+    let videoOutputIsHevc = videoStream?.codecpar.codecId === AV_CODEC_ID_HEVC;
+
     // Setup video transcoding if needed
     if (videoStream && !this.isVideoCodecSupported(videoStream.codecpar.codecId)) {
       // Check if we need hardware acceleration
@@ -600,8 +605,10 @@ export class RTPStream {
       };
 
       const bitrate = this.options.video.bitrate;
+
       this.videoEncoder = await Encoder.create(encoderCodec, {
         decoder: this.videoDecoder,
+        filter: this.videoFilter,
         maxBFrames: 0,
         options: encoderOptions,
         configure: (ctx) => {
@@ -609,6 +616,12 @@ export class RTPStream {
         },
       });
       this.throwIfStopRequested();
+
+      videoOutputIsHevc = encoderCodec.id === AV_CODEC_ID_HEVC;
+    }
+
+    if (videoStream && videoOutputIsHevc && this.options.video?.dumpExtra) {
+      this.videoBitstreamFilter = BitStreamFilterAPI.create('dump_extra', this.videoEncoder ?? videoStream, { options: { freq: 'k' } });
     }
 
     // Setup video output
@@ -1029,7 +1042,7 @@ export class RTPStream {
       this.pipeline = pipeline(
         this.input,
         {
-          video: [this.videoDecoder, this.videoFilter, this.videoEncoder],
+          video: [this.videoDecoder, this.videoFilter, this.videoEncoder, this.videoBitstreamFilter],
           audio: [this.audioDecoder, this.audioFilter, this.audioEncoder],
         },
         {
@@ -1042,7 +1055,7 @@ export class RTPStream {
       this.pipeline = pipeline(
         this.input,
         {
-          video: [this.videoDecoder, this.videoFilter, this.videoEncoder],
+          video: [this.videoDecoder, this.videoFilter, this.videoEncoder, this.videoBitstreamFilter],
         },
         this.videoOutput!,
         opts,
