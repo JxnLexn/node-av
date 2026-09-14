@@ -282,6 +282,7 @@ export class RTPStream {
         width: options.video?.width,
         height: options.video?.height,
         bitrate: options.video?.bitrate,
+        dumpExtra: options.video?.dumpExtra,
         encoderOptions: options.video?.encoderOptions ?? {},
       },
       audio: {

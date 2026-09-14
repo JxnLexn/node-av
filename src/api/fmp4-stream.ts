@@ -429,6 +429,7 @@ export class FMP4Stream {
         width: options.video?.width,
         height: options.video?.height,
         bitrate: options.video?.bitrate,
+        tag: options.video?.tag,
         encoderOptions: options.video?.encoderOptions ?? {},
       },
       audio: {
