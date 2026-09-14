@@ -229,6 +229,10 @@ export interface FMP4StreamOptions {
     width?: number;
     height?: number;
     bitrate?: number;
+    /**
+     * FourCC sample entry tag for the HEVC video stream, e.g. `hvc1`. Only applied to HEVC output.
+     */
+    tag?: string;
     encoderOptions?: EncoderOptions['options'];
   };
 
@@ -272,6 +276,20 @@ export interface FMP4StreamOptions {
    * If already aborted when start() is called, throws AbortError.
    */
   signal?: AbortSignal;
+}
+
+/**
+ * Video description of the muxed fMP4 output.
+ */
+export interface FMP4VideoInfo {
+  /** Output codec family. */
+  codec: 'h264' | 'hevc' | 'av1' | 'unknown';
+  /** RFC 6381 codec string of the output (e.g. `hvc1.1.6.L120.B0`). */
+  codecString: string;
+  width: number;
+  height: number;
+  /** Frames per second, 0 when unknown. */
+  fps: number;
 }
 
 /**
@@ -635,6 +653,55 @@ export class FMP4Stream {
   }
 
   /**
+   * Video description of the muxed fMP4 output (output codec, RFC 6381 codec string, resolution, fps).
+   *
+   * Available after {@link start} has opened the input.
+   *
+   * @returns The output video info, or `undefined` when there is no video track.
+   *
+   * @example
+   * ```typescript
+   * const videoInfo = stream.getVideoInfo();
+   * if (videoInfo) {
+   *   console.log(`Codec: ${videoInfo.codec}, Resolution: ${videoInfo.width}x${videoInfo.height}, FPS: ${videoInfo.fps}`);
+   * }
+   * ```
+   */
+  getVideoInfo(): FMP4VideoInfo | undefined {
+    if (this.source) {
+      if (!this.source.video) {
+        return undefined;
+      }
+      return {
+        codec: 'h264',
+        codecString: FMP4_CODECS.H264,
+        width: this.options.video?.width ?? 0,
+        height: this.options.video?.height ?? 0,
+        fps: this.options.video?.fps ?? 0,
+      };
+    }
+
+    const videoStream = this.input?.video();
+    if (!videoStream) {
+      return undefined;
+    }
+
+    const codecId = videoStream.codecpar.codecId;
+    const transcode = !this.isVideoCodecSupported(codecId);
+    const codecString = transcode ? FMP4_CODECS.H264 : (avGetCodecString(videoStream.codecpar) ?? FMP4_CODECS.H264);
+    const codec: FMP4VideoInfo['codec'] =
+      transcode || codecId === AV_CODEC_ID_H264 ? 'h264' : codecId === AV_CODEC_ID_HEVC ? 'hevc' : codecId === AV_CODEC_ID_AV1 ? 'av1' : 'unknown';
+    const rate = videoStream.avgFrameRate;
+    return {
+      codec,
+      codecString,
+      width: transcode && this.options.video?.width ? this.options.video.width : videoStream.codecpar.width,
+      height: transcode && this.options.video?.height ? this.options.video.height : videoStream.codecpar.height,
+      fps: transcode && this.options.video?.fps ? this.options.video.fps : rate.den ? rate.num / rate.den : 0,
+    };
+  }
+
+  /**
    * Start streaming media to fMP4 chunks.
    *
    * Begins the media processing pipeline, reading packets from input,
@@ -924,6 +991,17 @@ export class FMP4Stream {
       format: 'mp4',
       bufferSize: this.options.bufferSize,
       exitOnError: false,
+      configure: (fmt) => {
+        const tag = this.options.video?.tag;
+        if (!tag) {
+          return;
+        }
+        for (const stream of fmt.streams) {
+          if (stream.codecpar.codecId === AV_CODEC_ID_HEVC) {
+            stream.codecpar.codecTag = tag;
+          }
+        }
+      },
       options: {
         movflags: this.options.movFlags,
         frag_duration: this.options.fragDuration,
