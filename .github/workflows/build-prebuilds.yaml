@@ -886,7 +886,7 @@ jobs:
           node-version: "24"
 
       - name: Set up Homebrew
-        uses: Homebrew/actions/setup-homebrew@master
+        uses: Homebrew/actions/setup-homebrew@main
 
       - name: Read FFmpeg version
         id: ffmpeg-version
