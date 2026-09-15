@@ -11,6 +11,7 @@ import {
   AV_TIME_BASE_Q,
   AVERROR_EAGAIN,
   AVERROR_EOF,
+  AVERROR_ENOMEM,
   AVFMT_FLAG_CUSTOM_IO,
   AVFMT_GLOBALHEADER,
   AVFMT_NOFILE,
@@ -81,6 +82,26 @@ interface WriteJob {
  * Options for Muxer creation.
  */
 export interface MuxerOptions<F extends MuxerFormat | (string & {}) = MuxerFormat | (string & {})> {
+  /**
+   * Native interleaving queue budget in bytes, including packet metadata and
+   * backing buffers. Zero disables the limit. A packet that would exceed it
+   * fails with ENOMEM, even when exitOnError is false. Close the muxer on error.
+   * Does not bound codec or container-private buffers.
+   *
+   * @default 0
+   */
+  maxInterleaveBytes?: number;
+
+  /**
+   * Maximum backward DTS correction in microseconds. A larger correction
+   * terminates the write instead of collapsing resumed video into one-tick
+   * increments. Recreate the live session to establish a fresh A/V timeline.
+   * Zero keeps the generic muxer's permissive timestamp correction.
+   *
+   * @default 0
+   */
+  maxDtsCorrection?: number;
+
   /**
    * Input media for automatic metadata and property copying.
    *
@@ -383,6 +404,12 @@ export class Muxer implements AsyncDisposable, Disposable {
    * @internal
    */
   private constructor(options?: MuxerOptions) {
+    for (const key of ['maxInterleaveBytes', 'maxDtsCorrection'] as const) {
+      const value = options?.[key] ?? 0;
+      if (!Number.isSafeInteger(value) || value < 0) {
+        throw new RangeError(`${key} must be a non-negative safe integer`);
+      }
+    }
     this.options = {
       copyInitialNonkeyframes: false,
       exitOnError: true,
@@ -2432,7 +2459,10 @@ export class Muxer implements AsyncDisposable, Disposable {
 
       // Write the packet (muxer takes ownership and will unref it)
       // NOTE: Caller must clone packet if they need to keep it (e.g., for SyncQueue)
-      const ret = await this.formatContext.interleavedWriteFrame(pkt);
+      const ret = await this.formatContext.interleavedWriteFrame(pkt, this.options.maxInterleaveBytes);
+      if (ret === AVERROR_ENOMEM && this.options.maxInterleaveBytes) {
+        FFmpegError.throwIfError(ret, 'Interleaving queue memory limit exceeded');
+      }
 
       // Handle write errors
       if (ret < 0 && ret !== AVERROR_EOF) {
@@ -2500,7 +2530,10 @@ export class Muxer implements AsyncDisposable, Disposable {
 
       // Write the packet (muxer takes ownership and will unref it)
       // NOTE: Caller must clone packet if they need to keep it (e.g., for SyncQueue)
-      const ret = this.formatContext.interleavedWriteFrameSync(pkt);
+      const ret = this.formatContext.interleavedWriteFrameSync(pkt, this.options.maxInterleaveBytes);
+      if (ret === AVERROR_ENOMEM && this.options.maxInterleaveBytes) {
+        FFmpegError.throwIfError(ret, 'Interleaving queue memory limit exceeded');
+      }
 
       FFmpegError.throwIfError(ret, 'Failed to write packet');
     } finally {
@@ -2701,6 +2734,16 @@ export class Muxer implements AsyncDisposable, Disposable {
     // 2. Set packet timeBase
     // av_interleaved_write_frame uses this for sorting!
     pkt.timeBase = dstTb;
+
+    // Check the original rescaled DTS before either correction can hide a
+    // discontinuity. A one-tick clamp can otherwise make gigabytes of packets
+    // appear shorter than FFmpeg's time-based interleaving timeout.
+    if (this.options.maxDtsCorrection && pkt.dts !== AV_NOPTS_VALUE && streamInfo.lastMuxDts !== AV_NOPTS_VALUE) {
+      const regression = streamInfo.lastMuxDts - pkt.dts;
+      if (regression > 0n && avCompareTs(regression, dstTb, BigInt(this.options.maxDtsCorrection), AV_TIME_BASE_Q) > 0) {
+        throw new Error(`Timestamp discontinuity on stream ${streamIndex}: backward DTS exceeds ${this.options.maxDtsCorrection} microseconds`);
+      }
+    }
 
     // 3. Fix DTS > PTS (invalid relationship)
     // FFmpeg formula: median of (pts, dts, last_mux_dts+1)

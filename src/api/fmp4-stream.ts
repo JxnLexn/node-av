@@ -134,6 +134,20 @@ interface ParsedBox {
  */
 export interface FMP4StreamOptions {
   /**
+   * Native interleaving queue budget in bytes. Zero disables it.
+   *
+   * @default 67108864 (64 MiB)
+   */
+  maxInterleaveBytes?: number;
+
+  /**
+   * Maximum backward DTS correction in microseconds before onClose(error). Zero disables it.
+   *
+   * @default 1000000 (1 second)
+   */
+  maxDtsCorrection?: number;
+
+  /**
    * Callback invoked for fMP4 data (chunks or complete boxes).
    *
    * @param data - fMP4 data information with buffer and box details
@@ -438,6 +452,8 @@ export class FMP4Stream {
       bufferSize: options.bufferSize ?? 2 * 1024 * 1024,
       boxMode: options.boxMode ?? false,
       maxQueuedFragments: options.maxQueuedFragments ?? 16,
+      maxInterleaveBytes: options.maxInterleaveBytes ?? 64 * 1024 * 1024,
+      maxDtsCorrection: options.maxDtsCorrection ?? 1_000_000,
       movFlags: options.movFlags ?? '+frag_keyframe+separate_moof+default_base_moof+empty_moov',
     };
 
@@ -992,6 +1008,8 @@ export class FMP4Stream {
       format: 'mp4',
       bufferSize: this.options.bufferSize,
       exitOnError: false,
+      maxInterleaveBytes: this.options.maxInterleaveBytes,
+      maxDtsCorrection: this.options.maxDtsCorrection,
       configure: (fmt) => {
         const tag = this.options.video?.tag;
         if (!tag) {
@@ -1042,7 +1060,9 @@ export class FMP4Stream {
           this.options.onClose?.();
           return;
         }
-        await this.stop();
+        // close() can repeat the already-observed write error after cleanup.
+        // Deliver it once through onClose without an unhandled rejection.
+        await this.stop().catch(() => {});
         this.options.onClose?.(error);
       });
   }
@@ -1254,7 +1274,14 @@ export class FMP4Stream {
       // still be draining (header init reads the input's stream parameters),
       // so freeing the input before the muxer has fully settled is a
       // use-after-free on the worker thread.
-      await this.output?.close();
+      // Muxer.close() releases its resources before surfacing a write-worker
+      // error. Keep releasing input/codecs too; onClose receives that error.
+      let outputError: Error | undefined;
+      try {
+        await this.output?.close();
+      } catch (error) {
+        outputError = error instanceof Error ? error : new Error(String(error));
+      }
       this.output = undefined;
 
       this.videoDecoder?.close();
@@ -1286,6 +1313,7 @@ export class FMP4Stream {
       this._initSegmentPromise = null;
       this._ftypData = null;
       this._moovData = null;
+      if (outputError) throw outputError;
     } finally {
       this.stopRequested = false;
     }
