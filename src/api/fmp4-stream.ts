@@ -141,13 +141,6 @@ export interface FMP4StreamOptions {
   maxInterleaveBytes?: number;
 
   /**
-   * Maximum backward DTS correction in microseconds before onClose(error). Zero disables it.
-   *
-   * @default 1000000 (1 second)
-   */
-  maxDtsCorrection?: number;
-
-  /**
    * Callback invoked for fMP4 data (chunks or complete boxes).
    *
    * @param data - fMP4 data information with buffer and box details
@@ -453,7 +446,6 @@ export class FMP4Stream {
       boxMode: options.boxMode ?? false,
       maxQueuedFragments: options.maxQueuedFragments ?? 16,
       maxInterleaveBytes: options.maxInterleaveBytes ?? 64 * 1024 * 1024,
-      maxDtsCorrection: options.maxDtsCorrection ?? 1_000_000,
       movFlags: options.movFlags ?? '+frag_keyframe+separate_moof+default_base_moof+empty_moov',
     };
 
@@ -1009,7 +1001,6 @@ export class FMP4Stream {
       bufferSize: this.options.bufferSize,
       exitOnError: false,
       maxInterleaveBytes: this.options.maxInterleaveBytes,
-      maxDtsCorrection: this.options.maxDtsCorrection,
       configure: (fmt) => {
         const tag = this.options.video?.tag;
         if (!tag) {
@@ -1276,11 +1267,11 @@ export class FMP4Stream {
       // use-after-free on the worker thread.
       // Muxer.close() releases its resources before surfacing a write-worker
       // error. Keep releasing input/codecs too; onClose receives that error.
-      let outputError: Error | undefined;
       try {
         await this.output?.close();
-      } catch (error) {
-        outputError = error instanceof Error ? error : new Error(String(error));
+      } catch {
+        // attachCompletion reports the original error through onClose.
+        // Explicit stop() callers should still get successful teardown.
       }
       this.output = undefined;
 
@@ -1313,7 +1304,6 @@ export class FMP4Stream {
       this._initSegmentPromise = null;
       this._ftypData = null;
       this._moovData = null;
-      if (outputError) throw outputError;
     } finally {
       this.stopRequested = false;
     }

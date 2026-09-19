@@ -75,20 +75,6 @@ describe('Muxer live-memory safeguards', () => {
   });
 
   for (const sync of [false, true]) {
-    it(`rejects a large DTS regression before clamping (${sync ? 'sync' : 'async'})`, async () => {
-      const f = fixture({ maxDtsCorrection: 1_000_000, exitOnError: false });
-      const write = () => (sync ? f.output.writePacketSync(f.packet, f.index) : f.output.writePacket(f.packet, f.index));
-      try {
-        f.setDts(15360n * 3600n);
-        await write();
-        f.setDts(0n);
-        await assert.rejects(async () => write(), /Timestamp discontinuity/);
-        assert.ok(f.packet.size > 0, 'caller retains ownership of its original packet');
-      } finally {
-        await f.close();
-      }
-    });
-
     it(`bounds native buffering even with one-tick DTS and permissive write errors (${sync ? 'sync' : 'async'})`, async () => {
       const limit = 128 * 1024;
       const f = fixture({ maxInterleaveBytes: limit, exitOnError: false });
@@ -110,12 +96,12 @@ describe('Muxer live-memory safeguards', () => {
     });
   }
 
-  it('preserves small DTS corrections for tolerant live inputs', async () => {
-    const f = fixture({ maxDtsCorrection: 1_000_000 });
+  it('preserves existing DTS correction for a camera clock wobble', async () => {
+    const f = fixture({ maxInterleaveBytes: 128 * 1024 });
     try {
-      f.setDts(15360n);
+      f.setDts(15360n * 60n);
       f.output.writePacketSync(f.packet, f.index);
-      f.setDts(15360n - 512n);
+      f.setDts(15360n * 30n);
       f.output.writePacketSync(f.packet, f.index);
     } finally {
       await f.close();
@@ -181,7 +167,7 @@ describe('Muxer live-memory safeguards', () => {
 
   it('reports a worker failure once and releases FMP4 input even if muxer close repeats it', async () => {
     const input = await Demuxer.open(getInputFile('demux.mp4'));
-    const error = new Error('Timestamp discontinuity');
+    const error = new Error('Interleaving queue memory limit exceeded');
     let closed = 0;
     const stream = FMP4Stream.create(input, {
       onClose: (err) => {
@@ -227,17 +213,41 @@ describe('Muxer live-memory safeguards', () => {
     }
   });
 
-  it('ends a real FMP4 pipeline on a source timestamp reset and can start a fresh session', { timeout: 10000 }, async () => {
+  it('completes the first external stop even when closing the muxer repeats a worker error', async () => {
+    const input = await Demuxer.open(getInputFile('demux.mp4'));
+    const stream = FMP4Stream.create(input);
+    const state = stream as unknown as {
+      output: { close(): Promise<void> } | undefined;
+      input: Demuxer | undefined;
+    };
+    state.output = {
+      close: async () => {
+        throw new Error('Interleaving queue memory limit exceeded');
+      },
+    };
+    await assert.doesNotReject(stream.stop());
+    assert.equal(input.isInputOpen, false);
+    assert.equal(state.output, undefined);
+    assert.equal(state.input, undefined);
+  });
+
+  it('ends a real FMP4 pipeline on native budget exhaustion and can start a fresh session', { timeout: 10000 }, async () => {
     const input = await Demuxer.open(getInputFile('demux.mp4'));
     const packets = input.packets.bind(input);
+    const limit = 8 * 1024;
     let videoPackets = 0;
+    let videoBytes = 0;
+    let largestPacket = 0;
     input.packets = async function* (index?: number) {
       for await (const packet of packets(index)) {
-        if (packet?.streamIndex === input.video()!.index && ++videoPackets >= 5) {
-          const tb = input.video()!.timeBase;
-          const reset = BigInt(Math.round((3600 * tb.den) / tb.num));
-          packet.dts -= reset;
-          packet.pts -= reset;
+        if (packet) {
+          // Advertise both streams but withhold audio, and keep video DTS
+          // monotonic with a tiny span. Only the byte budget can end this run.
+          if (packet.streamIndex !== input.video()!.index) continue;
+          packet.dts = BigInt(videoPackets++);
+          packet.pts = packet.dts;
+          videoBytes += packet.size;
+          largestPacket = Math.max(largestPacket, packet.size);
         }
         yield packet;
       }
@@ -249,6 +259,7 @@ describe('Muxer live-memory safeguards', () => {
     });
     const stream = FMP4Stream.create(input, {
       supportedCodecs: 'avc1,mp4a.40.2',
+      maxInterleaveBytes: limit,
       onClose: (error) => {
         closeCount++;
         resolveClosed(error);
@@ -257,11 +268,13 @@ describe('Muxer live-memory safeguards', () => {
     try {
       await stream.start();
       const error = await closed;
-      assert.match(error?.message ?? '', /Timestamp discontinuity/);
+      assert.match(error?.message ?? '', /Interleaving queue memory limit exceeded/);
+      assert.ok(videoPackets > 1 && videoBytes > largestPacket, 'exhaust the budget through accumulated packets, including their native metadata');
+      assert.ok(largestPacket < limit, 'reject accumulated buffering rather than an oversized first packet');
       assert.equal(closeCount, 1);
       assert.equal(input.isInputOpen, false, 'the failed session releases its native reader');
     } finally {
-      await stream.stop();
+      await assert.doesNotReject(stream.stop(), 'external stop() must not repeat the budget failure');
     }
 
     let bytes = 0;
@@ -285,11 +298,9 @@ describe('Muxer live-memory safeguards', () => {
     }
   });
 
-  it('rejects invalid memory and timestamp limits', () => {
-    for (const key of ['maxInterleaveBytes', 'maxDtsCorrection'] as const) {
-      for (const value of [-1, NaN, Infinity, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
-        assert.throws(() => Muxer.openSync('unused.mp4', { [key]: value }), /non-negative safe integer/);
-      }
+  it('rejects invalid memory limits', () => {
+    for (const value of [-1, NaN, Infinity, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+      assert.throws(() => Muxer.openSync('unused.mp4', { maxInterleaveBytes: value }), /non-negative safe integer/);
     }
   });
 });

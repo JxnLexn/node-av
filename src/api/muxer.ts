@@ -93,16 +93,6 @@ export interface MuxerOptions<F extends MuxerFormat | (string & {}) = MuxerForma
   maxInterleaveBytes?: number;
 
   /**
-   * Maximum backward DTS correction in microseconds. A larger correction
-   * terminates the write instead of collapsing resumed video into one-tick
-   * increments. Recreate the live session to establish a fresh A/V timeline.
-   * Zero keeps the generic muxer's permissive timestamp correction.
-   *
-   * @default 0
-   */
-  maxDtsCorrection?: number;
-
-  /**
    * Input media for automatic metadata and property copying.
    *
    * When provided, Muxer will automatically copy:
@@ -404,11 +394,9 @@ export class Muxer implements AsyncDisposable, Disposable {
    * @internal
    */
   private constructor(options?: MuxerOptions) {
-    for (const key of ['maxInterleaveBytes', 'maxDtsCorrection'] as const) {
-      const value = options?.[key] ?? 0;
-      if (!Number.isSafeInteger(value) || value < 0) {
-        throw new RangeError(`${key} must be a non-negative safe integer`);
-      }
+    const maxInterleaveBytes = options?.maxInterleaveBytes ?? 0;
+    if (!Number.isSafeInteger(maxInterleaveBytes) || maxInterleaveBytes < 0) {
+      throw new RangeError('maxInterleaveBytes must be a non-negative safe integer');
     }
     this.options = {
       copyInitialNonkeyframes: false,
@@ -2734,16 +2722,6 @@ export class Muxer implements AsyncDisposable, Disposable {
     // 2. Set packet timeBase
     // av_interleaved_write_frame uses this for sorting!
     pkt.timeBase = dstTb;
-
-    // Check the original rescaled DTS before either correction can hide a
-    // discontinuity. A one-tick clamp can otherwise make gigabytes of packets
-    // appear shorter than FFmpeg's time-based interleaving timeout.
-    if (this.options.maxDtsCorrection && pkt.dts !== AV_NOPTS_VALUE && streamInfo.lastMuxDts !== AV_NOPTS_VALUE) {
-      const regression = streamInfo.lastMuxDts - pkt.dts;
-      if (regression > 0n && avCompareTs(regression, dstTb, BigInt(this.options.maxDtsCorrection), AV_TIME_BASE_Q) > 0) {
-        throw new Error(`Timestamp discontinuity on stream ${streamIndex}: backward DTS exceeds ${this.options.maxDtsCorrection} microseconds`);
-      }
-    }
 
     // 3. Fix DTS > PTS (invalid relationship)
     // FFmpeg formula: median of (pts, dts, last_mux_dts+1)
